@@ -15,7 +15,6 @@ require (
 	github.com/chai2010/gettext-go v0.0.0-20170215093142-bf70f2a70fb1 // indirect
 	github.com/containerd/console v0.0.0-20181022165439-0650fd9eeb50
 	github.com/docker/distribution v2.7.1+incompatible // indirect
-	github.com/docker/docker v1.14.0-0.20190319215453-e7b5f7dbe98c
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/docker/spdystream v0.0.0-20181023171402-6480d4af844c // indirect
 	github.com/elazarl/goproxy v0.0.0-20190421051319-9d40249d3c2f // indirect
@@ -35,15 +34,14 @@ require (
 	github.com/moby/buildkit v0.5.1
 	github.com/onsi/ginkgo v1.8.0 // indirect
 	github.com/onsi/gomega v1.5.0 // indirect
+	github.com/opencontainers/image-spec v1.0.1
 	github.com/opentracing/opentracing-go v1.1.0 // indirect
 	github.com/peterbourgon/diskv v2.0.1+incompatible // indirect
 	github.com/rancher/mapper v0.0.0-20190426050457-84da984f3146 // indirect
 	github.com/rancher/rio v0.1.1
 	github.com/rancher/wrangler v0.1.4
-	github.com/shurcooL/sanitized_anchor_name v1.0.0 // indirect
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v0.0.5 // indirect
-	github.com/stretchr/testify v1.3.0
 	github.com/urfave/cli v1.20.1-0.20190203184040-693af58b4d51
 	golang.org/x/crypto v0.0.0-20190618222545-ea8f1a30c443 // indirect
 	golang.org/x/sync v0.0.0-20190423024810-112230192c58
@@ -51,6 +49,7 @@ require (
 	google.golang.org/appengine v1.5.0 // indirect
 	google.golang.org/genproto v0.0.0-20190502173448-54afdca5d873 // indirect
 	google.golang.org/grpc v1.21.1 // indirect
+	gopkg.in/yaml.v2 v2.2.2
 	k8s.io/api v0.0.0-20190606204050-af9c91bd2759
 	k8s.io/apiextensions-apiserver v0.0.0-20190606210616-f848dc7be4a4 // indirect
 	k8s.io/apimachinery v0.0.0-20190404173353-6a84e37a896d
@@ -59,6 +58,5 @@ require (
 	k8s.io/klog v0.3.1 // indirect
 	k8s.io/kubernetes v1.14.3
 	k8s.io/utils v0.0.0-20190607212802-c55fbcfc754a // indirect
-	knative.dev/pkg v0.0.0-20190708230044-84d3910c565e // indirect
 	sigs.k8s.io/kustomize v2.0.3+incompatible // indirect
 )

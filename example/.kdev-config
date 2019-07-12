@@ -1,0 +1,5 @@
+kdev:
+  build_context: ./example
+  target:
+    kind: Deployment
+    apiVersion: extensions/v1beta1
