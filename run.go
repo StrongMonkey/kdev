@@ -313,7 +313,6 @@ func runBuild(buildSpec map[string]buildFile, namespace string, c *clicontext.CL
 			if err != nil {
 				return err
 			}
-			os.RemoveAll("./image-output")
 			m.LoadOrStore(name, image)
 			return nil
 		})
@@ -340,13 +339,10 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (
 		return "", err
 	}
 
-	if !strings.Contains(tag, ":") {
-		dig, err := getBuildDigest(buildSpec, c)
-		if err != nil {
-			return "", err
-		}
-		buildSpec.Tag += "@" + dig
+	if err := os.MkdirAll("./image-output", 0755); err != nil {
+		return "", err
 	}
+	defer os.RemoveAll("./image-output")
 
 	solveOpt := client.SolveOpt{
 		Frontend: "dockerfile.v0",
@@ -362,6 +358,15 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (
 	if buildSpec.NoCache {
 		solveOpt.FrontendAttrs["no-cache"] = ""
 	}
+
+	if !strings.Contains(buildSpec.Tag, ":") {
+		digest, err := getBuildDigest(buildSpec, c)
+		if err != nil {
+			return "", err
+		}
+		buildSpec.Tag += "@" + digest
+	}
+
 	image := fmt.Sprintf("%s/%s", buildSpec.PushRegistry, buildSpec.Tag)
 	exportFormat := "type=image,name=" + image
 	if buildSpec.Push {
@@ -395,6 +400,17 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (
 	if err := eg.Wait(); err != nil {
 		return "", err
 	}
+	data, err := ioutil.ReadFile("./image-output/index.json")
+	if err != nil {
+		return "", err
+	}
+	index := &v12.Index{}
+	if err := json.Unmarshal(data, index); err != nil {
+		return "", err
+	}
+	if !strings.Contains(image, ":") {
+		image += "@" + index.Manifests[0].Digest.String()
+	}
 
 	return image, nil
 }
@@ -422,9 +438,6 @@ func getBuildDigest(buildSpec *buildFile, c *clicontext.CLIContext) (string, err
 		Session: attachable,
 	}
 
-	if err := os.MkdirAll("./image-output", 0755); err != nil {
-		return "", err
-	}
 	exportCache, err := build.ParseExportCache([]string{"type=local,dest=./image-output"}, nil)
 	if err != nil {
 		return "", err

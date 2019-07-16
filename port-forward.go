@@ -10,7 +10,7 @@ import (
 )
 
 type PortForward struct {
-	P_Port string `desc:"Set port forward, example 8080:80"`
+	P_Port      string `desc:"Set port forward, example 8080:80"`
 	N_Namespace string `desc:"Set namespace" default:"default"`
 }
 
