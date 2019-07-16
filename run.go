@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"k8s.io/apimachinery/pkg/labels"
 	"net/http"
 	"net/url"
@@ -22,7 +20,6 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/util/progress/progressui"
-	v12 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/rancher/rio/cli/pkg/clicontext"
 	"github.com/rancher/rio/cli/pkg/kvfile"
 	"github.com/rancher/rio/pkg/constructors"
@@ -309,7 +306,7 @@ func runBuild(buildSpec map[string]buildFile, namespace string, c *clicontext.CL
 	for name, config := range buildSpec {
 		buildConfig := config
 		errg.Go(func() error {
-			image, err := buildInternal(&buildConfig, c, buildConfig.Tag)
+			image, err := buildInternal(&buildConfig, c)
 			if err != nil {
 				return err
 			}
@@ -328,7 +325,7 @@ func runBuild(buildSpec map[string]buildFile, namespace string, c *clicontext.CL
 	return result, nil
 }
 
-func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (string, error) {
+func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -338,11 +335,6 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (
 	if err != nil {
 		return "", err
 	}
-
-	if err := os.MkdirAll("./image-output", 0755); err != nil {
-		return "", err
-	}
-	defer os.RemoveAll("./image-output")
 
 	solveOpt := client.SolveOpt{
 		Frontend: "dockerfile.v0",
@@ -357,14 +349,6 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (
 	}
 	if buildSpec.NoCache {
 		solveOpt.FrontendAttrs["no-cache"] = ""
-	}
-
-	if !strings.Contains(buildSpec.Tag, ":") {
-		digest, err := getBuildDigest(buildSpec, c)
-		if err != nil {
-			return "", err
-		}
-		buildSpec.Tag += "@" + digest
 	}
 
 	image := fmt.Sprintf("%s/%s", buildSpec.PushRegistry, buildSpec.Tag)
@@ -382,15 +366,29 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (
 	eg, ctx := errgroup.WithContext(c.Ctx)
 	displayCh := ch
 
+	var digest string
 	eg.Go(func() error {
 		resp, err := buildkitClient.Solve(ctx, nil, solveOpt, ch)
 		if err != nil {
 			return err
 		}
 		for k, v := range resp.ExporterResponse {
-			logrus.Debugf("exporter response: %s=%s", k, v)
+			if k == "containerimage.digest" {
+				digest = v
+			}
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(buildSpec.Tag, ":") {
+			newBuildSpec := *buildSpec
+			newBuildSpec.Tag += "@" + digest
+			_, err = buildInternal(&newBuildSpec, c)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 
 	eg.Go(func() error {
@@ -400,82 +398,11 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext, tag string) (
 	if err := eg.Wait(); err != nil {
 		return "", err
 	}
-	data, err := ioutil.ReadFile("./image-output/index.json")
-	if err != nil {
-		return "", err
-	}
-	index := &v12.Index{}
-	if err := json.Unmarshal(data, index); err != nil {
-		return "", err
-	}
-	if !strings.Contains(image, ":") {
-		image += "@" + index.Manifests[0].Digest.String()
+	if !strings.Contains(buildSpec.Tag, ":") && !strings.Contains(buildSpec.Tag, "@") {
+		image = fmt.Sprintf("%s/%s@%s", buildSpec.PushRegistry, buildSpec.Tag, digest)
 	}
 
 	return image, nil
-}
-
-func getBuildDigest(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	attachable := []session.Attachable{authprovider.NewDockerAuthProvider()}
-
-	buildkitClient, err := client.New(ctx, "tcp://localhost:9000")
-	if err != nil {
-		return "", err
-	}
-
-	solveOpt := client.SolveOpt{
-		Frontend: "dockerfile.v0",
-		FrontendAttrs: map[string]string{
-			"filename": buildSpec.Dockerfile,
-		},
-		LocalDirs: map[string]string{
-			"context":    buildSpec.BuildContext,
-			"dockerfile": buildSpec.DockerfilePath,
-		},
-		Session: attachable,
-	}
-
-	exportCache, err := build.ParseExportCache([]string{"type=local,dest=./image-output"}, nil)
-	if err != nil {
-		return "", err
-	}
-	solveOpt.CacheExports = exportCache
-
-	ch := make(chan *client.SolveStatus)
-	eg, ctx := errgroup.WithContext(c.Ctx)
-	displayCh := ch
-
-	eg.Go(func() error {
-		resp, err := buildkitClient.Solve(ctx, nil, solveOpt, ch)
-		if err != nil {
-			return err
-		}
-		for k, v := range resp.ExporterResponse {
-			logrus.Debugf("exporter response: %s=%s", k, v)
-		}
-		return err
-	})
-
-	eg.Go(func() error {
-		var c console.Console
-		return progressui.DisplaySolveStatus(context.TODO(), "", c, os.Stderr, displayCh)
-	})
-	if err := eg.Wait(); err != nil {
-		return "", err
-	}
-
-	data, err := ioutil.ReadFile("./image-output/index.json")
-	if err != nil {
-		return "", err
-	}
-	index := &v12.Index{}
-	if err := json.Unmarshal(data, index); err != nil {
-		return "", err
-	}
-	return index.Manifests[0].Digest.String(), nil
 }
 
 func prepareBuildkit(c *clicontext.CLIContext, namespace string, config string, stopChan chan struct{}) error {
