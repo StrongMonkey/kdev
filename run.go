@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/labels"
 	"net/http"
 	"net/url"
 	"os"
@@ -100,7 +101,9 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 		return err
 	}
 	deploy.Namespace = r.N_Namespace
+	deploy.Name = r.Name
 	podSpec := deploy.Spec.Template.Spec
+	podSpec.Containers[0].Name = r.Name
 
 	if deploy.Name == "" {
 		workingDir, err := os.Getwd()
@@ -141,10 +144,12 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 		deploy.Spec.Selector = &metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				"app": deploy.Name,
+				"kdev": "true",
 			},
 		}
 		deploy.Spec.Template.Labels = map[string]string{
 			"app": deploy.Name,
+			"kdev": "true",
 		}
 		deploy.Spec.Template.Spec = podSpec
 		if _, err := c.K8s.AppsV1().Deployments(deploy.Namespace).Create(deploy); err != nil && !errors.IsAlreadyExists(err) {
@@ -167,7 +172,9 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 		pod.Namespace = r.N_Namespace
 		pod.Name = deploy.Name
 		pod.Annotations = deploy.Annotations
-		pod.Labels = deploy.Labels
+		pod.Labels = labels.Merge(deploy.Labels, map[string]string{
+			"kdev": "true",
+		})
 		pod.Spec = podSpec
 		if err := c.Create(pod); err != nil {
 			return err

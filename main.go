@@ -83,6 +83,9 @@ func main() {
 		builder.Command(&PortForward{},
 			"forward ports on a pod",
 			appName+" portforward [OPTION] $pod_name", "Port forwarding"),
+			builder.Command(&Pods{},
+			"view pods launched by kdev",
+				appName+" pods", ""),
 	}
 	app.Before = func(context *cli.Context) error {
 		if context.Bool("debug") {
