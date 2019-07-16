@@ -86,8 +86,8 @@ type RunOptions struct {
 type Run struct {
 	BuildOptions
 	RunOptions
-	Pod       bool   `desc:"Running a pod instead of deployment"`
-	Name      string `desc:"Assign a name to the pod or deployment"`
+	Pod         bool   `desc:"Running a pod instead of deployment"`
+	Name        string `desc:"Assign a name to the pod or deployment"`
 	N_Namespace string `desc:"Set namespace" default:"default"`
 }
 
@@ -143,12 +143,12 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 	if !r.Pod {
 		deploy.Spec.Selector = &metav1.LabelSelector{
 			MatchLabels: map[string]string{
-				"app": deploy.Name,
+				"app":  deploy.Name,
 				"kdev": "true",
 			},
 		}
 		deploy.Spec.Template.Labels = map[string]string{
-			"app": deploy.Name,
+			"app":  deploy.Name,
 			"kdev": "true",
 		}
 		deploy.Spec.Template.Spec = podSpec
@@ -612,6 +612,7 @@ func buildkitDeployment(namespace string) *appv1.Deployment {
 	}
 	hostPathFileType := v1.HostPathFile
 	hostPathDirectoryType := v1.HostPathDirectory
+	hostPathDirectoryOrCreateType := v1.HostPathDirectoryOrCreate
 	deploy.Spec.Template = v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
@@ -648,6 +649,10 @@ func buildkitDeployment(namespace string) *appv1.Deployment {
 						{
 							Name:      "containerd",
 							MountPath: "/run/containerd",
+						},
+						{
+							Name:      "buildkit",
+							MountPath: "/var/lib/buildkit",
 						},
 					},
 				},
@@ -687,6 +692,15 @@ func buildkitDeployment(namespace string) *appv1.Deployment {
 						HostPath: &v1.HostPathVolumeSource{
 							Type: &hostPathDirectoryType,
 							Path: "/run/containerd",
+						},
+					},
+				},
+				{
+					Name: "buildkit",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Type: &hostPathDirectoryOrCreateType,
+							Path: "/var/lib/buildkit",
 						},
 					},
 				},
