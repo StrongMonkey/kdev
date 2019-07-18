@@ -62,11 +62,7 @@ func (b *Build) Run(c *clicontext.CLIContext) error {
 	}
 
 	buildkitPortForwardStop := make(chan struct{})
-	buildkitConfig := buildkitDockerConfig
-	if containerRuntime() == "" {
-		buildkitConfig = buildkitContainerdConfig
-	}
-	if err := prepareBuildkit(c, b.N_Namespace, buildkitConfig, buildkitPortForwardStop); err != nil {
+	if err := prepareBuildkit(c, b.N_Namespace, buildkitPortForwardStop); err != nil {
 		return err
 	}
 	logrus.Info("Running build")
