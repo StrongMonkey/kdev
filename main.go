@@ -52,6 +52,12 @@ var (
     all = true
     keepBytes = 1024000000
 `
+	buildkitDockerConfig = `
+[grpc]
+  address = [ "tcp://0.0.0.0:8080" ]
+  # debugAddress is address for attaching go profiles and debuggers.
+  debugAddress = "0.0.0.0:6060"
+`
 )
 
 func main() {
@@ -80,12 +86,12 @@ func main() {
 		builder.Command(&Up{},
 			"apply build config file",
 			appName+" up [OPTION]", "Apply a buildConfig file"),
-		builder.Command(&PortForward{},
+		builder.Command(&Pf{},
 			"forward ports on a pod",
-			appName+" portforward [OPTION] $pod_name", "Port forwarding"),
+			appName+" pf [OPTION] $pod_name", "Port forwarding"),
 			builder.Command(&Pods{},
 			"view pods launched by kdev",
-				appName+" pods", ""),
+				appName+" pf", ""),
 	}
 	app.Before = func(context *cli.Context) error {
 		if context.Bool("debug") {

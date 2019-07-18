@@ -8,14 +8,14 @@ import (
 	riov1 "github.com/rancher/rio/pkg/apis/rio.cattle.io/v1"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
-	extensionv1 "k8s.io/api/extensions/v1beta1"
 	appv1 "k8s.io/api/apps/v1"
+	extensionv1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type Up struct {
-	F_File    string `desc:"Specify build file"`
-	Namespace string `desc:"Set namespace" default:"default"`
+	F_File      string `desc:"Specify build file"`
+	N_Namespace string `desc:"Set namespace" default:"default"`
 }
 
 func (u *Up) Run(c *clicontext.CLIContext) error {
@@ -25,17 +25,21 @@ func (u *Up) Run(c *clicontext.CLIContext) error {
 	}
 
 	buildkitPortForwardStop := make(chan struct{})
-	if err := prepareBuildkit(c, u.Namespace, buildkitContainerdConfig, buildkitPortForwardStop); err != nil {
+	buildkitConfig := buildkitDockerConfig
+	if containerRuntime() == "" {
+		buildkitConfig = buildkitContainerdConfig
+	}
+	if err := prepareBuildkit(c, u.N_Namespace, buildkitConfig, buildkitPortForwardStop); err != nil {
 		return err
 	}
 
-	imageMeta, err := runBuild(buildConfig, u.Namespace, c)
+	imageMeta, err := runBuild(buildConfig, u.N_Namespace, c)
 	if err != nil {
 		return err
 	}
 
 	for name, config := range buildConfig {
-		if err := updateImage(c, config.Target.APIVersion, config.Target.Kind, u.Namespace, name, imageMeta); err != nil {
+		if err := updateImage(c, config.Target.APIVersion, config.Target.Kind, u.N_Namespace, name, imageMeta); err != nil {
 			return err
 		}
 	}
@@ -54,7 +58,7 @@ func updateImage(c *clicontext.CLIContext, apiVersion, kind, namespace, name str
 			return err
 		}
 
-	} else if (apiVersion == appv1.SchemeGroupVersion.String() || apiVersion == extensionv1.SchemeGroupVersion.String())  && kind == "Deployment" {
+	} else if (apiVersion == appv1.SchemeGroupVersion.String() || apiVersion == extensionv1.SchemeGroupVersion.String()) && kind == "Deployment" {
 		deploy, err := c.K8s.AppsV1().Deployments(namespace).Get(name, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -84,6 +88,6 @@ func (u *Up) loadBuildFile() (map[string]buildFile, error) {
 			return nil, err
 		}
 	}
-	setDefaults(buildConfig, u.Namespace)
+	setDefaults(buildConfig, u.N_Namespace)
 	return buildConfig, nil
 }

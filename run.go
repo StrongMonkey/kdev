@@ -3,7 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"k8s.io/apimachinery/pkg/labels"
+	"github.com/rancher/wrangler/pkg/name"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,7 +14,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/docker/pkg/jsonmessage"
+
 	"github.com/containerd/console"
+	"github.com/docker/cli/cli/streams"
+	client2 "github.com/docker/docker/client"
 	"github.com/mattn/go-shellwords"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/cmd/buildctl/build"
@@ -33,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -42,6 +48,10 @@ import (
 	portforwardtools "k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/portforward"
+)
+
+const (
+	minikubeDockerSocat = "/run/docker.sock"
 )
 
 type RunOptions struct {
@@ -113,7 +123,11 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 	}
 
 	buildkitPortForwardStop := make(chan struct{})
-	if err := prepareBuildkit(c, r.N_Namespace, buildkitContainerdConfig, buildkitPortForwardStop); err != nil {
+	buildkitConfig := buildkitDockerConfig
+	if containerRuntime() == "" {
+		buildkitConfig = buildkitContainerdConfig
+	}
+	if err := prepareBuildkit(c, r.N_Namespace, buildkitConfig, buildkitPortForwardStop); err != nil {
 		return err
 	}
 
@@ -158,8 +172,9 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 		}
 		ctx, cancel := context.WithCancel(c.Ctx)
 		wait.JitterUntil(func() {
+			logrus.Info("waiting for new pod to be coming")
 			pod, err = findPod(c, deploy.Namespace, fmt.Sprintf("app=%s", deploy.Name))
-			if err == nil {
+			if err == nil && pod.Spec.Containers[0].Image == imageMeta[deploy.Name] {
 				cancel()
 				return
 			}
@@ -183,8 +198,12 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 		logrus.Info("Waiting for pod to be running")
 		if p, err := c.Core.Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{}); err == nil {
 			if p.Status.Phase == v1.PodRunning {
-				cancel()
-				return
+				for _, c := range p.Status.ContainerStatuses {
+					if (strings.Contains(imageMeta[deploy.Name], c.ImageID) || strings.Contains(imageMeta[deploy.Name], c.Image)) && c.Ready == true && c.State.Running != nil {
+						cancel()
+						return
+					}
+				}
 			}
 		}
 	}, time.Second, 1.5, false, ctx.Done())
@@ -326,6 +345,22 @@ func runBuild(buildSpec map[string]buildFile, namespace string, c *clicontext.CL
 }
 
 func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
+	if containerRuntime() == "" {
+		return buildInternalContainerd(buildSpec, c)
+	}
+	image, err :=  buildInternalDocker(buildSpec, c)
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(image, "@") {
+		repo, digest := kv.Split(image, "@")
+		return fmt.Sprintf("%s:%s", repo, name.Hex(digest, 5)), nil
+	}
+	return image, nil
+
+}
+
+func initializeBuildkitClient(buildSpec *buildFile, c *clicontext.CLIContext) (*client.Client, client.SolveOpt, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -333,7 +368,7 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext) (string, erro
 
 	buildkitClient, err := client.New(ctx, "tcp://localhost:9000")
 	if err != nil {
-		return "", err
+		return nil, client.SolveOpt{}, err
 	}
 
 	solveOpt := client.SolveOpt{
@@ -349,6 +384,115 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext) (string, erro
 	}
 	if buildSpec.NoCache {
 		solveOpt.FrontendAttrs["no-cache"] = ""
+	}
+	return buildkitClient, solveOpt, nil
+}
+
+func buildInternalDocker(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
+	buildkitClient, solveOpt, err := initializeBuildkitClient(buildSpec, c)
+	if err != nil {
+		return "", nil
+	}
+	var exportFormat string
+	var outputFile *os.File
+	image := fmt.Sprintf("%s/%s", buildSpec.PushRegistry, buildSpec.Tag)
+	if !strings.Contains(buildSpec.Tag, "@") {
+		exportFormat = fmt.Sprintf("type=image,name=%s", image)
+		if buildSpec.Push {
+			exportFormat += ",push=true"
+		}
+	} else {
+		outputFile, err = ioutil.TempFile("", "docker-image")
+		if err != nil {
+			return "", err
+		}
+		repo, digest := kv.Split(buildSpec.Tag, "@")
+		exportFormat = fmt.Sprintf("type=docker,name=%s:%s,dest=%s", repo, name.Hex(digest, 5), outputFile.Name())
+	}
+
+	exports, err := build.ParseOutput([]string{exportFormat})
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(buildSpec.Tag, "@") {
+		exports[0].Output = outputFile
+	}
+	solveOpt.Exports = exports
+
+	ch := make(chan *client.SolveStatus)
+	eg, ctx := errgroup.WithContext(c.Ctx)
+	displayCh := ch
+
+	var digest string
+	eg.Go(func() error {
+		resp, err := buildkitClient.Solve(ctx, nil, solveOpt, ch)
+		if err != nil {
+			return err
+		}
+		for k, v := range resp.ExporterResponse {
+			if k == "containerimage.digest" {
+				digest = v
+			}
+		}
+
+		// this is a hack that when exporting to epoDigest will not be exported if digest is not specified
+		if !strings.Contains(buildSpec.Tag, ":") {
+			newBuildSpec := *buildSpec
+			newBuildSpec.Tag += "@" + digest
+			_, err = buildInternalDocker(&newBuildSpec, c)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	eg.Go(func() error {
+		var c console.Console
+		return progressui.DisplaySolveStatus(context.TODO(), "", c, os.Stderr, displayCh)
+	})
+	if err := eg.Wait(); err != nil {
+		return "", err
+	}
+
+	if strings.Contains(buildSpec.Tag, "@") {
+		os.Setenv("DOCKER_HOST", "tcp://localhost:9001")
+		os.Setenv("DOCKER_API_VERSION", "1.35")
+		dockerClient, err := client2.NewClientWithOpts(client2.FromEnv)
+		if err != nil {
+			return "", err
+		}
+		f, err := os.Open(outputFile.Name())
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+
+		resp, err := dockerClient.ImageLoad(context.Background(), f, true)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+
+		if resp.Body != nil && resp.JSON {
+			if err := jsonmessage.DisplayJSONMessagesToStream(resp.Body, streams.NewOut(os.Stdout), nil); err != nil {
+				return "", err
+			}
+		}
+	}
+
+	if !strings.Contains(buildSpec.Tag, ":") && !strings.Contains(buildSpec.Tag, "@") {
+		image = fmt.Sprintf("%s/%s@%s", buildSpec.PushRegistry, buildSpec.Tag, digest)
+	}
+
+
+	return image, nil
+}
+
+func buildInternalContainerd(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
+	buildkitClient, solveOpt, err := initializeBuildkitClient(buildSpec, c)
+	if err != nil {
+		return "", nil
 	}
 
 	image := fmt.Sprintf("%s/%s", buildSpec.PushRegistry, buildSpec.Tag)
@@ -377,13 +521,11 @@ func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext) (string, erro
 				digest = v
 			}
 		}
-		if err != nil {
-			return err
-		}
+		// this is a hack that when exporting to repoDigest will not be exported if digest is not specified
 		if !strings.Contains(buildSpec.Tag, ":") {
 			newBuildSpec := *buildSpec
 			newBuildSpec.Tag += "@" + digest
-			_, err = buildInternal(&newBuildSpec, c)
+			_, err = buildInternalContainerd(&newBuildSpec, c)
 			if err != nil {
 				return err
 			}
@@ -453,6 +595,79 @@ func prepareBuildkit(c *clicontext.CLIContext, namespace string, config string, 
 	}
 	go func() {
 		if err := portForward(buildkitdPod, c, "9000", "8080", stopChan); err != nil {
+			logrus.Error(err)
+		}
+	}()
+	time.Sleep(time.Second)
+
+	if containerRuntime() == "minikube" {
+		if err := prepareDockerSocat(c, minikubeDockerSocat, stopChan); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func prepareDockerSocat(c *clicontext.CLIContext, socketAddress string, stopChan chan struct{}) error {
+	T := true
+	hostPathFileType := v1.HostPathFile
+	socatPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "socat-docker-socket",
+			Namespace: "default",
+		},
+		Spec: v1.PodSpec{
+			HostNetwork: true,
+			Containers: []v1.Container{
+				{
+					Name:  "socat",
+					Image: "alpine/socat:1.0.3",
+					Command: []string{
+						"socat",
+						"TCP-LISTEN:2375,fork",
+						fmt.Sprintf("UNIX-CONNECT:%s", socketAddress),
+					},
+					SecurityContext: &v1.SecurityContext{
+						Privileged: &T,
+					},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      "containerd-sock",
+							MountPath: minikubeDockerSocat,
+						},
+					},
+				},
+			},
+			Volumes: []v1.Volume{
+				{
+					Name: "containerd-sock",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Type: &hostPathFileType,
+							Path: minikubeDockerSocat,
+						},
+					},
+				},
+			},
+		},
+	}
+	if _, err := c.Core.Pods("default").Create(socatPod); err != nil && !errors.IsAlreadyExists(err) {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wait.JitterUntil(func() {
+		logrus.Info("Waiting for pod to be running")
+		if p, err := c.Core.Pods(socatPod.Namespace).Get(socatPod.Name, metav1.GetOptions{}); err == nil {
+			if p.Status.Phase == v1.PodRunning {
+				cancel()
+				return
+			}
+		}
+	}, time.Second, 1.5, false, ctx.Done())
+
+	go func() {
+		if err := portForward(socatPod, c, "9001", "2375", stopChan); err != nil {
 			logrus.Error(err)
 		}
 	}()
@@ -578,22 +793,6 @@ func buildkitDeployment(namespace string) *appv1.Deployment {
 							MountPath: "/etc/buildkit/buildkitd.toml",
 							SubPath:   "buildkitd.toml",
 						},
-						{
-							Name:      "containerd-sock",
-							MountPath: "/run/k3s/containerd/containerd.sock",
-						},
-						{
-							Name:      "rancher",
-							MountPath: "/var/lib/rancher",
-						},
-						{
-							Name:      "containerd",
-							MountPath: "/run/containerd",
-						},
-						{
-							Name:      "buildkit",
-							MountPath: "/var/lib/buildkit",
-						},
 					},
 				},
 			},
@@ -608,44 +807,66 @@ func buildkitDeployment(namespace string) *appv1.Deployment {
 						},
 					},
 				},
-				{
-					Name: "containerd-sock",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Type: &hostPathFileType,
-							Path: "/run/k3s/containerd/containerd.sock",
-						},
-					},
-				},
-				{
-					Name: "rancher",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Type: &hostPathDirectoryType,
-							Path: "/var/lib/rancher",
-						},
-					},
-				},
-				{
-					Name: "containerd",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Type: &hostPathDirectoryType,
-							Path: "/run/containerd",
-						},
-					},
-				},
-				{
-					Name: "buildkit",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Type: &hostPathDirectoryOrCreateType,
-							Path: "/var/lib/buildkit",
-						},
+			},
+		},
+	}
+	if containerRuntime() == "" {
+		deploy.Spec.Template.Spec.Containers[0].VolumeMounts = append(deploy.Spec.Template.Spec.Containers[0].VolumeMounts, []v1.VolumeMount{
+			{
+				Name:      "containerd-sock",
+				MountPath: "/run/k3s/containerd/containerd.sock",
+			},
+			{
+				Name:      "rancher",
+				MountPath: "/var/lib/rancher",
+			},
+			{
+				Name:      "containerd",
+				MountPath: "/run/containerd",
+			},
+			{
+				Name:      "buildkit",
+				MountPath: "/var/lib/buildkit",
+			},
+		}...)
+		deploy.Spec.Template.Spec.Volumes = append(deploy.Spec.Template.Spec.Volumes, []v1.Volume{
+			{
+				Name: "containerd-sock",
+				VolumeSource: v1.VolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
+						Type: &hostPathFileType,
+						Path: "/run/k3s/containerd/containerd.sock",
 					},
 				},
 			},
-		},
+			{
+				Name: "rancher",
+				VolumeSource: v1.VolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
+						Type: &hostPathDirectoryType,
+						Path: "/var/lib/rancher",
+					},
+				},
+			},
+			{
+				Name: "containerd",
+				VolumeSource: v1.VolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
+						Type: &hostPathDirectoryType,
+						Path: "/run/containerd",
+					},
+				},
+			},
+			{
+				Name: "buildkit",
+				VolumeSource: v1.VolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
+						Type: &hostPathDirectoryOrCreateType,
+						Path: "/var/lib/buildkit",
+					},
+				},
+			},
+		}...)
 	}
 	return deploy
 }
@@ -940,5 +1161,8 @@ func mergeBuildOptions(options BuildOptions, buildConfig *buildFile) {
 	if options.Push {
 		buildConfig.Push = options.Push
 	}
+}
 
+func containerRuntime() string {
+	return os.Getenv("CONTAINER_RUNTIME")
 }
