@@ -5,7 +5,7 @@ Tools to use single-node kubernetes cluster to develop and build applications.
 Support:
 * [k3s](https://github.com/rancher/k3s)
 * [k3d](https://github.com/rancher/k3d)
-* minikube(TODO)
+* minikube
 * docker for mac, docker for windows(TODO)
 
 ## Building
@@ -26,6 +26,12 @@ kdev cli will launch buildkit server in kubernetes cluster to perform build task
 ### Requirements
 
 You will need to have Dockerfile in your repo.
+
+### Runtime
+By default k3s/k3d will work by default with containerd runtime. If you are using minikube, run
+```
+export CONTAINER_RUNTIME=minikube
+```
 
 ### Quick start
 
@@ -85,7 +91,7 @@ foo:
 
 To port-forward an exsiting pod, run
 ```
-kdev portforward -p 8080:80 $podname
+kdev pf -p 8080:80 $podname
 ```
 
 

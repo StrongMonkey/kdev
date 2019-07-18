@@ -9,12 +9,12 @@ import (
 	"strconv"
 )
 
-type PortForward struct {
+type Pf struct {
 	P_Port      string `desc:"Set port forward, example 8080:80"`
 	N_Namespace string `desc:"Set namespace" default:"default"`
 }
 
-func (p *PortForward) Run(c *clicontext.CLIContext) error {
+func (p *Pf) Run(c *clicontext.CLIContext) error {
 	if len(c.CLI.Args()) == 0 {
 		return fmt.Errorf("pod name is required")
 	}
