@@ -3,9 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/rancher/wrangler/pkg/name"
-	"io/ioutil"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,22 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/pkg/jsonmessage"
-
-	"github.com/containerd/console"
-	"github.com/docker/cli/cli/streams"
-	client2 "github.com/docker/docker/client"
 	"github.com/mattn/go-shellwords"
-	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/cmd/buildctl/build"
-	"github.com/moby/buildkit/session"
-	"github.com/moby/buildkit/session/auth/authprovider"
-	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/rancher/rio/cli/pkg/clicontext"
 	"github.com/rancher/rio/cli/pkg/kvfile"
-	"github.com/rancher/rio/pkg/constructors"
 	"github.com/rancher/rio/pkg/pretty/stringers"
-	"github.com/rancher/wrangler/pkg/kubeconfig"
 	"github.com/rancher/wrangler/pkg/kv"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -42,12 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	portforwardtools "k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/transport/spdy"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/portforward"
 )
 
 const (
@@ -123,11 +104,7 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 	}
 
 	buildkitPortForwardStop := make(chan struct{})
-	buildkitConfig := buildkitDockerConfig
-	if containerRuntime() == "" {
-		buildkitConfig = buildkitContainerdConfig
-	}
-	if err := prepareBuildkit(c, r.N_Namespace, buildkitConfig, buildkitPortForwardStop); err != nil {
+	if err := prepareBuildkit(c, r.N_Namespace, buildkitPortForwardStop); err != nil {
 		return err
 	}
 
@@ -152,16 +129,14 @@ func (r *Run) Run(c *clicontext.CLIContext) error {
 
 	pod := &v1.Pod{}
 	if !r.Pod {
-		deploy.Spec.Selector = &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"app":  deploy.Name,
-				"kdev": "true",
-			},
-		}
-		deploy.Spec.Template.Labels = map[string]string{
+		selector := map[string]string{
 			"app":  deploy.Name,
 			"kdev": "true",
 		}
+		deploy.Spec.Selector = &metav1.LabelSelector{
+			MatchLabels: selector,
+		}
+		deploy.Spec.Template.Labels = selector
 		deploy.Spec.Template.Spec = podSpec
 		if _, err := c.K8s.AppsV1().Deployments(deploy.Namespace).Create(deploy); err != nil && !errors.IsAlreadyExists(err) {
 			return err
@@ -344,270 +319,6 @@ func runBuild(buildSpec map[string]buildFile, namespace string, c *clicontext.CL
 	return result, nil
 }
 
-func buildInternal(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
-	if containerRuntime() == "" {
-		return buildInternalContainerd(buildSpec, c)
-	}
-	image, err :=  buildInternalDocker(buildSpec, c)
-	if err != nil {
-		return "", err
-	}
-	if strings.Contains(image, "@") {
-		repo, digest := kv.Split(image, "@")
-		return fmt.Sprintf("%s:%s", repo, name.Hex(digest, 5)), nil
-	}
-	return image, nil
-
-}
-
-func initializeBuildkitClient(buildSpec *buildFile, c *clicontext.CLIContext) (*client.Client, client.SolveOpt, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	attachable := []session.Attachable{authprovider.NewDockerAuthProvider()}
-
-	buildkitClient, err := client.New(ctx, "tcp://localhost:9000")
-	if err != nil {
-		return nil, client.SolveOpt{}, err
-	}
-
-	solveOpt := client.SolveOpt{
-		Frontend: "dockerfile.v0",
-		FrontendAttrs: map[string]string{
-			"filename": buildSpec.Dockerfile,
-		},
-		LocalDirs: map[string]string{
-			"context":    buildSpec.BuildContext,
-			"dockerfile": buildSpec.DockerfilePath,
-		},
-		Session: attachable,
-	}
-	if buildSpec.NoCache {
-		solveOpt.FrontendAttrs["no-cache"] = ""
-	}
-	return buildkitClient, solveOpt, nil
-}
-
-func buildInternalDocker(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
-	buildkitClient, solveOpt, err := initializeBuildkitClient(buildSpec, c)
-	if err != nil {
-		return "", nil
-	}
-	var exportFormat string
-	var outputFile *os.File
-	image := fmt.Sprintf("%s/%s", buildSpec.PushRegistry, buildSpec.Tag)
-	if !strings.Contains(buildSpec.Tag, "@") {
-		exportFormat = fmt.Sprintf("type=image,name=%s", image)
-		if buildSpec.Push {
-			exportFormat += ",push=true"
-		}
-	} else {
-		outputFile, err = ioutil.TempFile("", "docker-image")
-		if err != nil {
-			return "", err
-		}
-		repo, digest := kv.Split(buildSpec.Tag, "@")
-		exportFormat = fmt.Sprintf("type=docker,name=%s:%s,dest=%s", repo, name.Hex(digest, 5), outputFile.Name())
-	}
-
-	exports, err := build.ParseOutput([]string{exportFormat})
-	if err != nil {
-		return "", err
-	}
-	if strings.Contains(buildSpec.Tag, "@") {
-		exports[0].Output = outputFile
-	}
-	solveOpt.Exports = exports
-
-	ch := make(chan *client.SolveStatus)
-	eg, ctx := errgroup.WithContext(c.Ctx)
-	displayCh := ch
-
-	var digest string
-	eg.Go(func() error {
-		resp, err := buildkitClient.Solve(ctx, nil, solveOpt, ch)
-		if err != nil {
-			return err
-		}
-		for k, v := range resp.ExporterResponse {
-			if k == "containerimage.digest" {
-				digest = v
-			}
-		}
-
-		// this is a hack that when exporting to epoDigest will not be exported if digest is not specified
-		if !strings.Contains(buildSpec.Tag, ":") {
-			newBuildSpec := *buildSpec
-			newBuildSpec.Tag += "@" + digest
-			_, err = buildInternalDocker(&newBuildSpec, c)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-
-	eg.Go(func() error {
-		var c console.Console
-		return progressui.DisplaySolveStatus(context.TODO(), "", c, os.Stderr, displayCh)
-	})
-	if err := eg.Wait(); err != nil {
-		return "", err
-	}
-
-	if strings.Contains(buildSpec.Tag, "@") {
-		os.Setenv("DOCKER_HOST", "tcp://localhost:9001")
-		os.Setenv("DOCKER_API_VERSION", "1.35")
-		dockerClient, err := client2.NewClientWithOpts(client2.FromEnv)
-		if err != nil {
-			return "", err
-		}
-		f, err := os.Open(outputFile.Name())
-		if err != nil {
-			return "", err
-		}
-		defer f.Close()
-
-		resp, err := dockerClient.ImageLoad(context.Background(), f, true)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-
-		if resp.Body != nil && resp.JSON {
-			if err := jsonmessage.DisplayJSONMessagesToStream(resp.Body, streams.NewOut(os.Stdout), nil); err != nil {
-				return "", err
-			}
-		}
-	}
-
-	if !strings.Contains(buildSpec.Tag, ":") && !strings.Contains(buildSpec.Tag, "@") {
-		image = fmt.Sprintf("%s/%s@%s", buildSpec.PushRegistry, buildSpec.Tag, digest)
-	}
-
-
-	return image, nil
-}
-
-func buildInternalContainerd(buildSpec *buildFile, c *clicontext.CLIContext) (string, error) {
-	buildkitClient, solveOpt, err := initializeBuildkitClient(buildSpec, c)
-	if err != nil {
-		return "", nil
-	}
-
-	image := fmt.Sprintf("%s/%s", buildSpec.PushRegistry, buildSpec.Tag)
-	exportFormat := "type=image,name=" + image
-	if buildSpec.Push {
-		exportFormat += ",push=true"
-	}
-	exports, err := build.ParseOutput([]string{exportFormat})
-	if err != nil {
-		return "", err
-	}
-	solveOpt.Exports = exports
-
-	ch := make(chan *client.SolveStatus)
-	eg, ctx := errgroup.WithContext(c.Ctx)
-	displayCh := ch
-
-	var digest string
-	eg.Go(func() error {
-		resp, err := buildkitClient.Solve(ctx, nil, solveOpt, ch)
-		if err != nil {
-			return err
-		}
-		for k, v := range resp.ExporterResponse {
-			if k == "containerimage.digest" {
-				digest = v
-			}
-		}
-		// this is a hack that when exporting to repoDigest will not be exported if digest is not specified
-		if !strings.Contains(buildSpec.Tag, ":") {
-			newBuildSpec := *buildSpec
-			newBuildSpec.Tag += "@" + digest
-			_, err = buildInternalContainerd(&newBuildSpec, c)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-
-	eg.Go(func() error {
-		var c console.Console
-		return progressui.DisplaySolveStatus(context.TODO(), "", c, os.Stderr, displayCh)
-	})
-	if err := eg.Wait(); err != nil {
-		return "", err
-	}
-	if !strings.Contains(buildSpec.Tag, ":") && !strings.Contains(buildSpec.Tag, "@") {
-		image = fmt.Sprintf("%s/%s@%s", buildSpec.PushRegistry, buildSpec.Tag, digest)
-	}
-
-	return image, nil
-}
-
-func prepareBuildkit(c *clicontext.CLIContext, namespace string, config string, stopChan chan struct{}) error {
-	configName := "buildkitd-config"
-	buildkitdConfig := constructors.NewConfigMap(namespace, configName, v1.ConfigMap{
-		Data: map[string]string{
-			"buildkitd.toml": config,
-		},
-	})
-	if existing, err := c.Core.ConfigMaps(namespace).Get(configName, metav1.GetOptions{}); err != nil && !errors.IsNotFound(err) {
-		return err
-	} else if err != nil {
-		if _, err := c.Core.ConfigMaps(namespace).Create(buildkitdConfig); err != nil {
-			return err
-		}
-	} else {
-		existing.Data = buildkitdConfig.Data
-		if _, err := c.Core.ConfigMaps(namespace).Update(existing); err != nil {
-			return err
-		}
-	}
-	buildkitdDeploy := buildkitDeployment(namespace)
-	if existing, err := c.K8s.AppsV1().Deployments(buildkitdDeploy.Namespace).Get(buildkitdDeploy.Name, metav1.GetOptions{}); err != nil && !errors.IsNotFound(err) {
-		return err
-	} else if errors.IsNotFound(err) {
-		if _, err := c.K8s.AppsV1().Deployments(buildkitdDeploy.Namespace).Create(buildkitdDeploy); err != nil {
-			return err
-		}
-	} else {
-		existing.Spec = buildkitdDeploy.Spec
-		if _, err := c.K8s.AppsV1().Deployments(namespace).Update(existing); err != nil {
-			return err
-		}
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	wait.JitterUntil(func() {
-		if deploy, err := c.K8s.AppsV1().Deployments(buildkitdDeploy.Namespace).Get(buildkitdDeploy.Name, metav1.GetOptions{}); err == nil {
-			if isReady(&deploy.Status) {
-				cancel()
-				return
-			}
-			logrus.Info("Waiting for buildkitd deploy to be ready")
-		}
-	}, time.Second, 1.5, false, ctx.Done())
-	buildkitdPod, err := findPod(c, namespace, "app=buildkitd-dev")
-	if err != nil {
-		return err
-	}
-	go func() {
-		if err := portForward(buildkitdPod, c, "9000", "8080", stopChan); err != nil {
-			logrus.Error(err)
-		}
-	}()
-	time.Sleep(time.Second)
-
-	if containerRuntime() == "minikube" {
-		if err := prepareDockerSocat(c, minikubeDockerSocat, stopChan); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func prepareDockerSocat(c *clicontext.CLIContext, socketAddress string, stopChan chan struct{}) error {
 	T := true
 	hostPathFileType := v1.HostPathFile
@@ -675,56 +386,6 @@ func prepareDockerSocat(c *clicontext.CLIContext, socketAddress string, stopChan
 	return nil
 }
 
-func portForward(pod *v1.Pod, c *clicontext.CLIContext, port, targetPort string, stopChan chan struct{}) error {
-	loader := kubeconfig.GetInteractiveClientConfig(c.CLI.String("kubeconfig"))
-
-	restConfig, err := loader.ClientConfig()
-	if err != nil {
-		return err
-	}
-	if err := setConfigDefaults(restConfig); err != nil {
-		return err
-	}
-	restClient, err := rest.RESTClientFor(restConfig)
-	if err != nil {
-		return err
-	}
-	ioStreams := genericclioptions.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr}
-
-	portForwardOpt := portforward.PortForwardOptions{
-		Namespace:    pod.Namespace,
-		PodName:      pod.Name,
-		RESTClient:   restClient,
-		Config:       restConfig,
-		PodClient:    c.K8s.CoreV1(),
-		Address:      []string{"localhost"},
-		Ports:        []string{fmt.Sprintf("%s:%s", port, targetPort)},
-		StopChannel:  stopChan,
-		ReadyChannel: make(chan struct{}),
-		PortForwarder: &defaultPortForwarder{
-			IOStreams: ioStreams,
-		},
-	}
-	return portForwardOpt.RunPortForward()
-}
-
-type defaultPortForwarder struct {
-	genericclioptions.IOStreams
-}
-
-func (f *defaultPortForwarder) ForwardPorts(method string, url *url.URL, opts portforward.PortForwardOptions) error {
-	transport, upgrader, err := spdy.RoundTripperFor(opts.Config)
-	if err != nil {
-		return err
-	}
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, method, url)
-	fw, err := portforwardtools.NewOnAddresses(dialer, opts.Address, opts.Ports, opts.StopChannel, opts.ReadyChannel, f.Out, f.ErrOut)
-	if err != nil {
-		return err
-	}
-	return fw.ForwardPorts()
-}
-
 func setConfigDefaults(config *rest.Config) error {
 	gv := v1.SchemeGroupVersion
 	config.GroupVersion = &gv
@@ -754,121 +415,6 @@ func findPod(c *clicontext.CLIContext, namespace string, selector string) (*v1.P
 		}
 	}
 	return &pods.Items[0], nil
-}
-
-func buildkitDeployment(namespace string) *appv1.Deployment {
-	deploy := &appv1.Deployment{}
-	deploy.Name = "buildkit"
-	deploy.Namespace = namespace
-	deploy.Spec.Selector = &metav1.LabelSelector{
-		MatchLabels: map[string]string{
-			"app": "buildkitd-dev",
-		},
-	}
-	hostPathFileType := v1.HostPathFile
-	hostPathDirectoryType := v1.HostPathDirectory
-	hostPathDirectoryOrCreateType := v1.HostPathDirectoryOrCreate
-	deploy.Spec.Template = v1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{
-				"app": "buildkitd-dev",
-			},
-		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{
-				{
-					Name:  "buildkitd",
-					Image: "moby/buildkit:v0.5.1",
-					Ports: []v1.ContainerPort{
-						{
-							ContainerPort: 8080,
-						},
-					},
-					SecurityContext: &v1.SecurityContext{
-						Privileged: &[]bool{true}[0],
-					},
-					VolumeMounts: []v1.VolumeMount{
-						{
-							Name:      "config",
-							MountPath: "/etc/buildkit/buildkitd.toml",
-							SubPath:   "buildkitd.toml",
-						},
-					},
-				},
-			},
-			Volumes: []v1.Volume{
-				{
-					Name: "config",
-					VolumeSource: v1.VolumeSource{
-						ConfigMap: &v1.ConfigMapVolumeSource{
-							LocalObjectReference: v1.LocalObjectReference{
-								Name: "buildkitd-config",
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	if containerRuntime() == "" {
-		deploy.Spec.Template.Spec.Containers[0].VolumeMounts = append(deploy.Spec.Template.Spec.Containers[0].VolumeMounts, []v1.VolumeMount{
-			{
-				Name:      "containerd-sock",
-				MountPath: "/run/k3s/containerd/containerd.sock",
-			},
-			{
-				Name:      "rancher",
-				MountPath: "/var/lib/rancher",
-			},
-			{
-				Name:      "containerd",
-				MountPath: "/run/containerd",
-			},
-			{
-				Name:      "buildkit",
-				MountPath: "/var/lib/buildkit",
-			},
-		}...)
-		deploy.Spec.Template.Spec.Volumes = append(deploy.Spec.Template.Spec.Volumes, []v1.Volume{
-			{
-				Name: "containerd-sock",
-				VolumeSource: v1.VolumeSource{
-					HostPath: &v1.HostPathVolumeSource{
-						Type: &hostPathFileType,
-						Path: "/run/k3s/containerd/containerd.sock",
-					},
-				},
-			},
-			{
-				Name: "rancher",
-				VolumeSource: v1.VolumeSource{
-					HostPath: &v1.HostPathVolumeSource{
-						Type: &hostPathDirectoryType,
-						Path: "/var/lib/rancher",
-					},
-				},
-			},
-			{
-				Name: "containerd",
-				VolumeSource: v1.VolumeSource{
-					HostPath: &v1.HostPathVolumeSource{
-						Type: &hostPathDirectoryType,
-						Path: "/run/containerd",
-					},
-				},
-			},
-			{
-				Name: "buildkit",
-				VolumeSource: v1.VolumeSource{
-					HostPath: &v1.HostPathVolumeSource{
-						Type: &hostPathDirectoryOrCreateType,
-						Path: "/var/lib/buildkit",
-					},
-				},
-			},
-		}...)
-	}
-	return deploy
 }
 
 func isReady(status *appv1.DeploymentStatus) bool {
@@ -1163,6 +709,10 @@ func mergeBuildOptions(options BuildOptions, buildConfig *buildFile) {
 	}
 }
 
-func containerRuntime() string {
-	return os.Getenv("CONTAINER_RUNTIME")
+func containerRuntime(c *clicontext.CLIContext) string {
+	nodes, err := c.Core.Nodes().List(metav1.ListOptions{})
+	if err == nil && len(nodes.Items) == 1 && nodes.Items[0].Name == "minikube"{
+		return "minikube"
+	}
+	return ""
 }

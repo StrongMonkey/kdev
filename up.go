@@ -25,11 +25,7 @@ func (u *Up) Run(c *clicontext.CLIContext) error {
 	}
 
 	buildkitPortForwardStop := make(chan struct{})
-	buildkitConfig := buildkitDockerConfig
-	if containerRuntime() == "" {
-		buildkitConfig = buildkitContainerdConfig
-	}
-	if err := prepareBuildkit(c, u.N_Namespace, buildkitConfig, buildkitPortForwardStop); err != nil {
+	if err := prepareBuildkit(c, u.N_Namespace, buildkitPortForwardStop); err != nil {
 		return err
 	}
 
