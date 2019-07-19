@@ -27,12 +27,6 @@ kdev cli will launch buildkit server in kubernetes cluster to perform build task
 
 You will need to have Dockerfile in your repo.
 
-### Runtime
-By default k3s/k3d will work by default with containerd runtime. If you are using minikube, run
-```
-export CONTAINER_RUNTIME=minikube
-```
-
 ### Quick start
 
 1. Download the latest release, or build it from source code.
